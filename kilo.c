@@ -1,5 +1,12 @@
 /* includes */
 
+// TODO: on step 76
+
+// feature test macros
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
@@ -31,11 +38,25 @@ enum editor_key {
 
 /* data */
 
+// editor row
+typedef struct erow {
+    size_t size;
+    char *chars;
+} erow;
+
 struct editor_config {
+    // nothing here should ever be negative
+
+    // cursor position
     size_t cx, cy;
-    // number of rows and cols should never be negative
+    // row offset
+    size_t row_off;
+    // column offset
+    size_t col_off;
     size_t screen_rows;
     size_t screen_cols;
+    size_t num_rows;
+    erow *row;
     struct termios orig_termios;
 };
 
@@ -209,6 +230,56 @@ int get_window_size(size_t *rows, size_t *cols) {
     }
 }
 
+/* row operations */
+
+void editor_append_row(char *s, size_t len) {
+    // allocate space for a new editor row, then copy the given string to the new editor row
+
+    // allocate enough space for the number of bytes each row takes times the number of rows
+    E.row = realloc(E.row, sizeof(erow) * (E.num_rows + 1));    
+
+    size_t at = E.num_rows;
+    E.row[at].size = len;
+    E.row[at].chars = malloc(len + 1);
+    memcpy(E.row[at].chars, s, len);
+    E.row[at].chars[len] = '\0';
+    E.num_rows++;
+}
+
+/* file i/o */
+
+void editor_open(char *filename) {
+    // open and read a file from disk
+
+    FILE *fp = fopen(filename, "r");
+    if (!fp) die("fopen");
+
+    char *line = NULL;
+    size_t linecap = 0;
+
+    // needs to be ssize_t since getline() can return -1 as an error
+    // note that the range of ssize_t is [-1, SIZE_MAX]
+    // see https://man.archlinux.org/man/core/man-pages/ssize_t.3type.en for info
+    ssize_t linelen_s;
+
+    // getline() allocates memory automatically
+    // the return value is the length of the line it read, or -1 if EOF
+    while ((linelen_s = getline(&line, &linecap, fp)) != -1) {
+        // if we get here, we know that linelen is positive since the only negative value ssize_t
+        // can hold is -1; therefore we create an unsigned version of it for use with memory things
+        size_t linelen_u = (size_t) linelen_s;
+
+        // strip the newline and carraige return since each erow already represents just one line
+        while (linelen_u > 0 && (line[linelen_u - 1] == '\n' || line[linelen_u - 1] == '\r'))
+            linelen_u--;
+
+        editor_append_row(line, linelen_u);
+    }
+
+    free(line);
+    fclose(fp);
+}
+
 /* append buffer */
 
 struct abuf {
@@ -247,33 +318,70 @@ void ab_free(struct abuf *ab) {
 
 /* output */
 
+void editor_scroll(void) {
+    if (E.cy < E.row_off) {
+        E.row_off = E.cy;
+    }
+    if (E.cy >= E.row_off + E.screen_rows) {
+        E.row_off = E.cy - E.screen_rows + 1;
+    }
+    if (E.cx < E.col_off) {
+        E.col_off = E.cx;
+    }
+    if (E.cx >= E.col_off + E.screen_cols) {
+        E.col_off = E.cx - E.screen_cols + 1;
+    }
+}
+
 void editor_draw_rows(struct abuf *ab) {
     // handle drawing each row of the buffer
 
     size_t y;
 
     for (y = 0; y < E.screen_rows; y++) {
-        // show the welcome message 1/3 of the way down
-        if (y == E.screen_rows / 3) {
-            char welcome[80];
-            size_t welcome_len = (size_t) snprintf(welcome, sizeof(welcome), 
-                "Kilo editor -- version %s", KILO_VERSION);
+        size_t filerow = y + E.row_off;
+        // check if we're drawing a row that's part of the text buffer
+        if (filerow >= E.num_rows) {
+            // show the welcome message 1/3 of the way down if the text buffer is empty (i.e. only
+            // display the welcome if a file isn't opened)
+            if (E.num_rows == 0 && y == E.screen_rows / 3) {
+                char welcome[80];
+                size_t welcome_len = (size_t) snprintf(welcome, sizeof(welcome), 
+                    "Kilo editor -- version %s", KILO_VERSION);
 
-            if (welcome_len > E.screen_cols) welcome_len = E.screen_cols;
+                if (welcome_len > E.screen_cols) welcome_len = E.screen_cols;
 
-            // print the message in the middle of the screen
-            size_t padding = (E.screen_cols - welcome_len) / 2;
+                // print the message in the middle of the screen
+                size_t padding = (E.screen_cols - welcome_len) / 2;
 
-            if (padding) {
+                if (padding) {
+                    ab_append(ab, "~", 1);
+                    padding--;
+                }
+
+                while (padding--) ab_append(ab, " ", 1);
+
+                ab_append(ab, welcome, welcome_len);
+            } else {
                 ab_append(ab, "~", 1);
-                padding--;
+            }
+        } else {
+            // draws the contents of the text buffer to screen
+            // with column offset added, this can be negative if the user scrolls past the end of a
+            // line
+            int len_s = (int) E.row[filerow].size - (int) E.col_off;
+
+            // handle the negative case and convert length back into an unsigned int
+            size_t len_u;
+            if (len_s < 0) {
+                len_u = 0;
+            } else {
+                len_u = (size_t) len_s;
             }
 
-            while (padding--) ab_append(ab, " ", 1);
-
-            ab_append(ab, welcome, welcome_len);
-        } else {
-            ab_append(ab, "~", 1);
+            // the text in the row can only be as long as the row itself
+            if (len_u > E.screen_cols) len_u = E.screen_cols;
+            ab_append(ab, &E.row[filerow].chars[E.col_off], len_u);
         }
 
         // clear each line as it's redrawn
@@ -286,6 +394,8 @@ void editor_draw_rows(struct abuf *ab) {
 }
 
 void editor_refresh_screen(void) {
+    editor_scroll();
+
     struct abuf ab = ABUF_INIT;
 
     // hide cursor before refreshing the screen
@@ -300,7 +410,9 @@ void editor_refresh_screen(void) {
     char buf[32];
 
     // specify the exact position to move the cursor (convert from 0 indexing to 1 indexing)
-    snprintf(buf, sizeof(buf), "\x1b[%zu;%zuH", E.cy + 1, E.cx + 1);
+    // E.cy refers to the position of the cursor within the text file, so we subtract the row offset
+    // to get the position on the screen
+    snprintf(buf, sizeof(buf), "\x1b[%zu;%zuH", (E.cy - E.row_off) + 1, (E.cx - E.col_off) + 1);
     ab_append(&ab, buf, strlen(buf));
 
     // show the cursor once the screen is refreshed
@@ -314,7 +426,9 @@ void editor_refresh_screen(void) {
 /* input */
 
 void editor_move_cursor(int key) {
-    // move the cursor with wasd, note that +y is down
+    // move the cursor with arrow keys, note that +y is down
+
+    erow *row = (E.cy >= E.num_rows) ? NULL : &E.row[E.cy];
 
     switch (key) {
         case ARROW_LEFT:
@@ -324,8 +438,7 @@ void editor_move_cursor(int key) {
             }
             break;
         case ARROW_RIGHT:
-            // prevent the cursor from exiting the screen to the right
-            if (E.cx != E.screen_cols - 1) {
+            if (row && E.cx < row->size) {
                 E.cx++;
             }
             break;
@@ -335,7 +448,7 @@ void editor_move_cursor(int key) {
             }
             break;
         case ARROW_DOWN:
-            if (E.cy != E.screen_rows - 1) {
+            if (E.cy < E.num_rows) {
                 E.cy++;
             }
             break;
@@ -386,18 +499,26 @@ void editor_process_keypress(void) {
 
 /* init */
 
-void init_editor(void) {
+void editor_init(void) {
     // set initial cursor position
     E.cx = 0;
     E.cy = 0;
+    E.row_off = 0;
+    E.col_off = 0;
+    E.num_rows = 0;
+    E.row = NULL;
 
     if (get_window_size(&E.screen_rows, &E.screen_cols) == -1) die("get_window_size");
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
     // disable canonical mode so we can register input by keypress instead of needing to press enter
     raw_mode_enable();
-    init_editor();
+    editor_init();
+
+    if (argc >= 2) {
+        editor_open(argv[1]);
+    }
 
     while (1) {
         editor_refresh_screen();
