@@ -1,6 +1,6 @@
 /* includes */
 
-// TODO: on step 76
+// NOTE: on step 76
 
 // feature test macros
 #define _DEFAULT_SOURCE
